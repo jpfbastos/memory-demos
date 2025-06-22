@@ -16,5 +16,5 @@ The following were the results of opening the server, and running Demo 3a 5 time
 
 |                   | 1 | 2 | 3 | 4 | 5 | Mean |
 |-------------------|---|---|---|---|---|---|
-| Throughput (GB/s) | 11.9394 | 11.9349 | 11.9276 | 11.9221 | 11.9334 | 11.9315 |
+| Throughput (GB/s) | 11.6596 | 11.6552 | 11.6480 | 11.6427 | 11.6537 | 11.6518 |
 | Latency (ms)      | 428.832 | 428.993 | 429.256 | 429.455 | 429.049 | 429.117 |
