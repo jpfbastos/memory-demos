@@ -73,7 +73,7 @@ int main() {
 
     elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
     std::cout << "H2D latency: " << elapsed_ms << " ms, "
-              << (SIZE / (1 << 20)) / (elapsed_ms / 1e3) << " MB/s" << std::endl;
+              << (SIZE / (1 << 30)) / (elapsed_ms / 1e3) << " GB/s" << std::endl;
 
 cleanup:
     if (d_data) cudaFree(d_data);
