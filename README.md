@@ -1,4 +1,5 @@
-These are demos to demonstrate understanding of shared memory and shared pinned memory with a server/client interaction.
+These are demos to show understanding of shared memory and shared pinned memory with a server/client interaction,
+and calculate memory througput from shared pinned memory to GPU.
 
 - Demo 1 uses a simple System V shared memory to share memory between two processes
 - Demo 2 creates CUDA pinned memory, and shares it, with the client copying the memory to a GPU
