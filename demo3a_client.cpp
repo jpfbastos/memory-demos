@@ -41,27 +41,15 @@ int main() {
     size_t page_size = sysconf(_SC_PAGESIZE);
     size_t aligned_bytes = ((SIZE + page_size - 1) / page_size) * page_size;
 
-    void* ptr = aligned_alloc(4096, aligned_bytes);
-    if (!ptr) {
-        std::cerr << "aligned_alloc failed\n";
-        close(shm_fd);
-        return 1;
-    }
-
     // Pin memory
-    CHECK(cudaHostRegister(ptr, aligned_bytes, cudaHostRegisterDefault));
-
-    std::cout << "Shared memory opened and pinned successfully.\n";
-
-    h_data = (char*)mmap(ptr, aligned_bytes, PROT_READ,
+    h_data = (char*)mmap(nullptr, aligned_bytes, PROT_READ,
                         MAP_SHARED | MAP_LOCKED, shm_fd, 0);
     if (h_data == MAP_FAILED) {
         perror("mmap");
-        cudaHostUnregister(ptr);
-        free(ptr);
         close(shm_fd);
         return 1;
     }
+    std::cout << "Shared memory opened successfully.\n";
 
     CHECK(cudaMalloc((void**)&d_data, aligned_bytes));
     CHECK(cudaMemcpy(d_data, h_data, SIZE, cudaMemcpyHostToDevice));
@@ -78,10 +66,6 @@ int main() {
 cleanup:
     if (d_data) cudaFree(d_data);
     if (h_data != MAP_FAILED) munmap(h_data, aligned_bytes);
-    if (ptr) {
-        cudaHostUnregister(ptr);
-        free(ptr);
-    }
     if (shm_fd != -1) close(shm_fd);
 
     return 0;

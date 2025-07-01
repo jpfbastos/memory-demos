@@ -1,0 +1,25 @@
+syntax="proto3";
+
+package allocator.v1;
+
+service Allocator {
+    rpc RequestSharedMemory(MemoryRequest) returns (MemoryReply);
+    rpc FreeSharedMemory(FreeRequest) returns (FreeReply);
+}
+
+message MemoryRequest {
+    int32 pid = 1;
+}
+
+message MemoryReply {
+    string shm_name = 1;
+    int32 size = 2;
+}
+
+message FreeRequest {
+    string shm_name = 1;
+}
+
+message FreeReply {
+    
+}
