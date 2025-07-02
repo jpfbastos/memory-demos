@@ -6,7 +6,6 @@
 #include <thread>
 #include <unistd.h>
 #include <signal.h>
-#include <cuda_runtime_api.h>
 #include <grpcpp/grpcpp.h>
 #include "allocator/allocator.grpc.pb.h"
 
@@ -109,6 +108,9 @@ int main() {
 
     // Print message from server
     std::cout << "Shared memory message: " << static_cast<char*>(h_data) << "\n";
+
+    // access the first byte
+    
 
     // wait 30 seconds
     std::cout << "Waiting for 20 seconds before freeing shared memory...\n";

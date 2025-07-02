@@ -24,291 +24,254 @@ using allocator::v1::MemoryRequest;
 using allocator::v1::MemoryReply;
 using allocator::v1::FreeRequest;
 using allocator::v1::FreeReply;
+using allocator::v1::ChunkInfo;
 
-const int SIZE = 4 * 1024; // 4 KB
+const size_t PAGE_SIZE = 4 * 1024 * 1024; // 4 MB Pages
+const size_t POOL_SIZE = 100 * 1024 * 1024; // 100 MB pool
+const char* POOL_SHM_NAME = "/memory_pool_main";
 const char* MESSAGE = "Allocator Server says hello :)";
 int running = 1;
 
-struct Allocation {
-    int fd;                    // file descriptor from shm_open
-    void* alloc_ptr;          // from aligned_alloc
-    void* mmap_ptr;           // from mmap
-    int lockfd;               // file descriptor for permission lock
-    std::string lockfile_path; // path to lockfile
-    bool access_revoked;      // flag indicating if access has been revoked
-    
-    Allocation() : fd(-1), alloc_ptr(nullptr), mmap_ptr(MAP_FAILED), 
-               lockfd(-1), access_revoked(true) {}
+struct Block {
+    size_t offset;
+    size_t size;
 };
-std::unordered_map<std::string, Allocation> allocations;
+std::vector<Block> free_list;
 std::mutex alloc_mutex;
-
-// Function to acquire permission lock for a shared memory segment
-bool acquirePermissionLock(Allocation& alloc, const std::string& shmName) {
-    alloc.lockfile_path = "/tmp/." + shmName + ".lock";
-    alloc.lockfd = open(alloc.lockfile_path.c_str(), O_CREAT | O_RDWR, 0640);
-    
-    if (alloc.lockfd == -1) {
-        perror("Failed to open lockfile");
-        return false;
-    }
-    
-    if (flock(alloc.lockfd, LOCK_EX) == -1) {
-        perror("Failed to acquire exclusive lock");
-        close(alloc.lockfd);
-        alloc.lockfd = -1;
-        return false;
-    }
-    
-    std::cout << "Acquired permission lock for " << shmName << std::endl;
-    return true;
-}
-
-// Function to release permission lock
-void releasePermissionLock(Allocation& alloc, const std::string& shmName) {
-    if (alloc.lockfd >= 0) {
-        flock(alloc.lockfd, LOCK_UN);
-        close(alloc.lockfd);
-        alloc.lockfd = -1;
-        
-        // Remove lockfile
-        if (!alloc.lockfile_path.empty()) {
-            unlink(alloc.lockfile_path.c_str());
-        }
-        
-        std::cout << "Released permission lock for " << shmName << std::endl;
-    }
-}
-
-// Function to revoke access to shared memory
-bool revokeSharedMemoryAccess(const std::string& shmName) {
-    
-    Allocation alloc;
-    {
-        std::lock_guard<std::mutex> lock(alloc_mutex);
-        auto it = allocations.find(shmName);
-        if (it == allocations.end()) {
-            std::cerr << "Shared memory not found for revocation: " << shmName << std::endl;
-            return false;
-        }
-        alloc = it->second;
-    }
-
-    std::cout << "Starting access revocation for " << shmName << std::endl;
-
-    if (!acquirePermissionLock(alloc, shmName)) {
-        return false;
-    }
-
-    if (fchmod(alloc.fd, 0000) == -1) {
-        perror("Failed to revoke permissions");
-        releasePermissionLock(alloc, shmName);
-        return false;
-    }
-
-    std::cout << "Revoked file permissions for /dev/shm" << shmName << std::endl;
-
-    {
-        std::lock_guard<std::mutex> lock(alloc_mutex);
-        auto it = allocations.find(shmName);
-        if (it != allocations.end()) {
-            it->second.access_revoked = true;
-        }
-    }
-    return true;
-}
+size_t occupied_memory_ = 0;
+std::unordered_map<size_t, size_t> allocation_map_;
+char* pool_base = nullptr;
+int pool_fd = -1;
+std::mutex pool_mutex;
 
 class AllocatorImpl : public allocator::v1::Allocator::Service {
-Status RequestSharedMemory(ServerContext* context,
+Status AllocateMemory(ServerContext* context,
                                   const MemoryRequest* request,
                                   MemoryReply* response) override {
-
-    std::string shm_name;
-    int shm_fd = -1;
-
-    // Retry until we get a unique name
-    uuid_t uuid;
-    uuid_generate(uuid);
-    char shm_name_array[37]; // 36 characters + null terminator
-    uuid_unparse(uuid, shm_name_array);
-    shm_name = std::string("/shm_") + shm_name_array;
-
-    shm_fd = shm_open(shm_name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0640);
-    if (shm_fd == -1) {
-        perror("shm_open");
-        return Status::CANCELLED;
+    size_t size = request->size();
+    std::cout << "Received AllocateMemory request for size: " << size << std::endl;
+    
+    if (size <= 0) {
+        std::cerr << "Invalid size requested: " << size << std::endl;
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "Size must be positive");
     }
 
-    if (ftruncate(shm_fd, SIZE) == -1) {
-        perror("ftruncate");
-        close(shm_fd);
-        shm_unlink(shm_name.c_str());
-        return Status::CANCELLED;
+    std::lock_guard<std::mutex> lock(pool_mutex);
+    size_t aligned_size = ((size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+    if (occupied_memory_ + aligned_size > POOL_SIZE) {
+        std::cerr << "Not enough memory in pool after alignment. Requested: " << aligned_size
+                  << ", Available: " << (POOL_SIZE - occupied_memory_) << std::endl;
+        return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, "Not enough memory in pool");
     }
 
-    size_t page_size = sysconf(_SC_PAGESIZE);
-    size_t aligned_bytes = ((SIZE + page_size - 1) / page_size) * page_size;
+    bool found = false;
 
-    // Allocate aligned memory
-    void* ptr = aligned_alloc(4096, aligned_bytes);
-    if (!ptr) {
-        std::cerr << "aligned_alloc failed\n";
-        close(shm_fd);
-        shm_unlink(shm_name.c_str());
-        return Status::CANCELLED;
+    for (auto it = free_list.begin(); it != free_list.end(); ++it) {
+        std::cout << "Checking free block: {" << it->offset << ", " << it->size / (1024*1024) << "MB}" << std::endl;
+        if (it->size >= aligned_size) {
+            ChunkInfo* chunk = response->add_chunks();
+            chunk->set_offset(it->offset);
+            chunk->set_size(aligned_size);
+
+            allocation_map_[it->offset] = aligned_size;  // track allocated block size
+            occupied_memory_ += aligned_size;
+
+            std::cout << "Allocated memory from free block: {" << it->offset << ", " << aligned_size / (1024*1024) << "MB}" << std::endl;
+            // Update free block: shrink or remove
+            if (it->size == aligned_size) {
+                free_list.erase(it);
+            } else {
+                it->offset += aligned_size;
+                it->size -= aligned_size;
+            }
+
+            found = true;
+            break;
+        }
     }
 
-    // Pin memory for CUDA
-    cudaError_t err = cudaHostRegister(ptr, aligned_bytes, cudaHostRegisterDefault);
-    if (err != cudaSuccess) {
-        std::cerr << "cudaHostRegister failed: " << cudaGetErrorString(err) << std::endl;
-        free(ptr);
-        close(shm_fd);
-        shm_unlink(shm_name.c_str());
-        return Status::CANCELLED;
+    if (!found) {
+        size_t running_size = 0;
+        auto it = free_list.begin();
+
+        while (running_size < aligned_size && it != free_list.end()) {
+            std::cout << "Checking free block: {" << it->offset << ", " << it->size << "}" << std::endl;
+            size_t chunk_size = std::min(it->size, aligned_size - running_size);
+            
+            ChunkInfo* chunk = response->add_chunks();
+            chunk->set_offset(it->offset);
+            chunk->set_size(chunk_size);
+            
+            running_size += chunk_size;
+            it->offset += chunk_size;
+            it->size -= chunk_size;
+            
+            allocation_map_[it->offset] = chunk_size; // track allocated block size
+            occupied_memory_ += chunk_size;
+
+            if (it->size == 0) {
+               it = free_list.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        
+        if (running_size == aligned_size) {
+            found = true;
+        } else {
+            std::cerr << "Failed to allocate enough memory from free blocks. Requested: " 
+                      << aligned_size << ", Allocated: " << running_size << std::endl;
+            return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, "Failed to allocate enough memory from free blocks");
+        }
     }
 
-    void* h_data = mmap(ptr, aligned_bytes, PROT_READ | PROT_WRITE,
-                        MAP_SHARED | MAP_LOCKED, shm_fd, 0);
-    if (h_data == MAP_FAILED) {
-        perror("mmap");
-        cudaHostUnregister(ptr);
-        free(ptr);
-        close(shm_fd);
-        shm_unlink(shm_name.c_str());
-        return Status::CANCELLED;
+    if (!found) {
+        std::cerr << "Failed to allocate aligned memory of size: " << aligned_size << std::endl;
+        return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, "Failed to allocate aligned memory");
     }
 
-    std::cout << "Writing message: " << shm_name << " " << MESSAGE << std::endl;
-    strcpy(static_cast<char*>(h_data), MESSAGE);
+    response->set_shm_name(POOL_SHM_NAME);
+    response->set_total_size(aligned_size); // Or sum of chunk sizes if multiple
 
-    // Store allocation with access control structure
-    {
-        std::lock_guard<std::mutex> lock(alloc_mutex);
-        Allocation alloc;
-        alloc.fd = shm_fd;
-        alloc.alloc_ptr = ptr;
-        alloc.mmap_ptr = h_data;
-        allocations[shm_name] = std::move(alloc);
+
+    // print free list for debugging
+    std::cout << "Free blocks after allocation: ";
+    for (const auto& block : free_list) {
+        std::cout << "{" << block.offset << ", " << block.size / (1024*1024) << "MB} ";
     }
+    std::cout << std::endl;
 
-    response->set_shm_name(shm_name);
-    response->set_size(SIZE);
-    std::cout << "Shared memory created and pinned successfully.\n";
-    return Status::OK;
+    // print allocation map for debugging
+    std::cout << "Allocation map after allocation: ";
+    for (const auto& [offset, size] : allocation_map_) {
+        std::cout << "{" << offset << ", " << std::dec << size / (1024*1024) << "MB} ";
+    }
+    std::cout << std::endl;
+
+    return grpc::Status::OK;
 }
 
 
 Status FreeSharedMemory(ServerContext* context,
                         const FreeRequest* request,
                         FreeReply* response) override {
-    const std::string& shm_name = request->shm_name();
-    std::cout << "Received FreeSharedMemory request for: " << shm_name << std::endl;
-    
-    // First revoke access to prevent new clients
-    if (!revokeSharedMemoryAccess(shm_name)) {
-        std::cerr << "Failed to revoke access for " << shm_name << std::endl;
-        return Status::CANCELLED;
+
+    for (const size_t offset : request->offset()) {
+        if (offset >= POOL_SIZE) {
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "Offset out of bounds");
+        }
+
+        std::cout << "Received FreeSharedMemory request for offset: " << offset << std::endl;
+
+        const auto& it = allocation_map_.find(offset);
+        if (it == allocation_map_.end()) {
+            std::cerr << "Pointer not found in allocation map: " << offset << std::endl;
+            return grpc::Status(grpc::StatusCode::NOT_FOUND, "Pointer not found");
+        }
+
+        const size_t alloc_size = it->second;
+        occupied_memory_ -= alloc_size;
+        allocation_map_.erase(it);
+        free_list.push_back({offset, alloc_size});
     }
-    
-    // Now safely cleanup resources
-    std::lock_guard<std::mutex> lock(alloc_mutex);
-    auto it = allocations.find(shm_name);
-    if (it == allocations.end()) {
-        std::cerr << "Shared memory not found during cleanup: " << shm_name << std::endl;
-        return Status::CANCELLED;
+
+    if (free_list.size() < 2) {
+        return grpc::Status::OK;
     }
 
-    Allocation& alloc = it->second;
+    std::sort(free_list.begin(), free_list.end(), [](const Block& a, const Block& b) {
+        return a.offset < b.offset;
+    });
 
-    size_t page_size = sysconf(_SC_PAGESIZE);
-    size_t aligned_bytes = ((SIZE + page_size - 1) / page_size) * page_size;
+    for (size_t i = 0; i < free_list.size() - 1; ++i) {
+        if (free_list[i].offset + free_list[i].size == free_list[i + 1].offset) {
+            free_list[i].size += free_list[i + 1].size;
+            free_list.erase(free_list.begin() + i + 1);
+            --i; // Check the new merged block again
 
-    // Cleanup resources
-    if (alloc.mmap_ptr && alloc.mmap_ptr != MAP_FAILED) {
-        if (munmap(alloc.mmap_ptr, aligned_bytes) == -1) {
-            perror(("munmap failed for " + shm_name).c_str());
         }
     }
 
-    if (alloc.alloc_ptr) {
-        cudaError_t err = cudaHostUnregister(alloc.alloc_ptr);
-        if (err != cudaSuccess) {
-            std::cerr << "cudaHostUnregister failed for " << shm_name << ": "
-                        << cudaGetErrorString(err) << std::endl;
-        }
-        free(alloc.alloc_ptr);
+    // print free list after freeing memory
+    std::cout << "Free blocks after freeing memory: ";
+    for (const auto& block : free_list) {
+        std::cout << "{" << block.offset << ", " << block.size / (1024*1024) << "MB} ";
     }
+    std::cout << std::endl;
 
-    // truncate the shared memory file to 0
-    if (ftruncate(alloc.fd, 0) == -1) {
-        perror(("ftruncate failed for " + shm_name).c_str());
-    }
+    return grpc::Status::OK;
 
-    if (alloc.fd >= 0) {
-        close(alloc.fd);
-    }
-
-    // Release permission lock
-    releasePermissionLock(alloc, shm_name);
-
-    if (shm_unlink(shm_name.c_str()) == -1) {
-        perror(("shm_unlink failed for " + shm_name).c_str());
-    }
-
-    allocations.erase(it);
-    std::cout << "Shared memory freed successfully: " << shm_name << std::endl;
-    return Status::OK;
 }
-
 };
 
 void handler(int sig) {
     running = 0;
 }
 
-void cleanupAll() {
-    std::lock_guard<std::mutex> lock(alloc_mutex);
+bool initialiseMemoryPool() {
+    std::cout << "Initialising memory pool..." << std::endl;
 
-    for (const auto& [name, alloc] : allocations) {
-        std::cout << "Cleaning up: " << name << std::endl;
-
-        // munmap with mmap pointer
-        size_t page_size = sysconf(_SC_PAGESIZE);
-        size_t aligned_bytes = ((SIZE + page_size - 1) / page_size) * page_size;
-
-        if (alloc.mmap_ptr && alloc.mmap_ptr != MAP_FAILED) {
-            if (munmap(alloc.mmap_ptr, aligned_bytes) == -1) {
-                perror(("munmap failed for " + name).c_str());
-            }
-        }
-
-        // cudaHostUnregister and free with aligned_alloc pointer
-        if (alloc.alloc_ptr) {
-            cudaError_t err = cudaHostUnregister(alloc.alloc_ptr);
-            if (err != cudaSuccess) {
-                std::cerr << "cudaHostUnregister failed for " << name << ": "
-                          << cudaGetErrorString(err) << std::endl;
-            }
-            free(alloc.alloc_ptr);
-        }
-
-        if (ftruncate(alloc.fd, 0) == -1) {
-            perror(("ftruncate failed for " + name).c_str());
-        }
-        
-        if (alloc.fd >= 0) {
-            close(alloc.fd);
-        }
-
-        // unlink shared memory
-        if (shm_unlink(name.c_str()) == -1) {
-            perror(("shm_unlink failed for " + name).c_str());
-        }
-
+    pool_fd = shm_open(POOL_SHM_NAME, O_CREAT | O_EXCL | O_RDWR, 0640);
+    if (pool_fd == -1) {
+        perror("shm_open");
+        return false;
     }
 
-    allocations.clear();
+    if (ftruncate(pool_fd, POOL_SIZE) == -1) {
+        perror("ftruncate");
+        close(pool_fd);
+        shm_unlink(POOL_SHM_NAME);
+        return false;
+    }
+
+    pool_base = static_cast<char*>(mmap(nullptr, POOL_SIZE, PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_LOCKED, pool_fd, 0));
+    if (pool_base == MAP_FAILED) {
+        perror("mmap");
+        close(pool_fd);
+        shm_unlink(POOL_SHM_NAME);
+        return false;
+    }
+
+    cudaError_t err = cudaHostRegister(pool_base, POOL_SIZE, cudaHostRegisterDefault);
+    if (err != cudaSuccess) {
+        std::cerr << "cudaHostRegister failed for pool: " << cudaGetErrorString(err) << std::endl;
+        munmap(pool_base, POOL_SIZE);
+        close(pool_fd);
+        shm_unlink(POOL_SHM_NAME);
+        return false;
+    }
+
+    free_list.push_back({0, POOL_SIZE}); // Initial free block covering the whole pool
+
+    std::cout << "Memory pool initialised successfully at address " << static_cast<void*>(pool_base) << std::endl;
+
+    uint32_t* ptr = reinterpret_cast<uint32_t*>(pool_base);
+    size_t count = POOL_SIZE / sizeof(uint32_t);
+
+    for (size_t i = 0; i < count; ++i) {
+        ptr[i] = i;  // fill with 0, 1, 2, ...
+    }
+
+    return true;
+}
+
+void cleanupAll() {
+    std::lock_guard<std::mutex> lock(alloc_mutex);
+    std::cout << "Cleaning up shared memory..." << std::endl;
+    cudaError_t err = cudaHostUnregister(pool_base);
+    if (err != cudaSuccess) {
+        std::cerr << "cudaHostUnregister failed during cleanup: " << cudaGetErrorString(err) << std::endl;
+    }
+
+    if (pool_base && pool_base != MAP_FAILED) {
+        munmap(pool_base, POOL_SIZE);
+    }
+    if (pool_fd >= 0) {
+        close(pool_fd);
+    }
+    shm_unlink(POOL_SHM_NAME);
+
     std::cout << "\n[server] All shared memory cleaned up.\n";
 }
 
@@ -323,6 +286,8 @@ int main() {
     std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
 
     std::cout << "Allocator server listening on port 50051" << std::endl;
+
+    initialiseMemoryPool();
 
     while (running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));

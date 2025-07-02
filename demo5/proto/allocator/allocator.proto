@@ -3,21 +3,27 @@ syntax="proto3";
 package allocator.v1;
 
 service Allocator {
-    rpc RequestSharedMemory(MemoryRequest) returns (MemoryReply);
+    rpc AllocateMemory(MemoryRequest) returns (MemoryReply);
     rpc FreeSharedMemory(FreeRequest) returns (FreeReply);
 }
 
 message MemoryRequest {
-    int32 pid = 1;
+    uint64 size = 1;
 }
 
 message MemoryReply {
     string shm_name = 1;
-    int32 size = 2;
+    repeated ChunkInfo chunks = 2;
+    uint64 total_size = 3;
+}
+
+message ChunkInfo {
+    int32 offset = 1;
+    uint64 size = 2;
 }
 
 message FreeRequest {
-    string shm_name = 1;
+    repeated int32 offset = 1;
 }
 
 message FreeReply {
