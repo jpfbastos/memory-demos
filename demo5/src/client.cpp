@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <grpcpp/grpcpp.h>
+#include <cuda_runtime_api.h>
 #include "allocator/allocator.grpc.pb.h"
 
 using grpc::Channel;
@@ -18,6 +19,18 @@ using allocator::v1::MemoryReply;
 using allocator::v1::FreeRequest;
 using allocator::v1::FreeReply;
 using allocator::v1::ChunkInfo;
+
+#define CHECK(call)                                                   \
+    {                                                                 \
+        const cudaError_t error = call;                               \
+        if (error != cudaSuccess) {                                   \
+            std::cerr << "Error: " << __FILE__ << ":" << __LINE__     \
+                      << ", code:" << error                           \
+                      << ", reason: " << cudaGetErrorString(error)    \
+                      << std::endl;                                   \
+            goto cleanup;                                             \
+        }                                                             \
+    }
 
 // Configuration constants
 namespace Config {
@@ -270,26 +283,27 @@ void printUsage(const char* program_name) {
     std::cout << "Default size: " << Config::DEFAULT_ALLOCATION_SIZE / (1024 * 1024) << "MB" << std::endl;
 }
 
-int parseSize(const char* arg) {
+size_t parseSize(const char* arg) {
     try {
         int size_mb = std::stoi(arg);
         if (size_mb <= 0) {
-            std::cerr << "Size must be positive" << std::endl;
-            return -1;
+            std::cerr << "Size must be a positive integer." << std::endl;
+            return 0;
         }
-        return size_mb * 1024 * 1024;
+        return static_cast<size_t>(size_mb) * 1024 * 1024;
     } catch (const std::exception& e) {
         std::cerr << "Invalid size argument: " << arg << std::endl;
-        return -1;
+        return 0;
     }
 }
+
 
 int main(int argc, char* argv[]) {
     // Parse command line arguments
     size_t allocation_size = Config::DEFAULT_ALLOCATION_SIZE;
     if (argc > 1) {
-        int parsed_size = parseSize(argv[1]);
-        if (parsed_size < 0) {
+        size_t parsed_size = parseSize(argv[1]);
+        if (parsed_size == 0) {
             printUsage(argv[0]);
             return 1;
         }
@@ -299,6 +313,13 @@ int main(int argc, char* argv[]) {
     // Set up signal handling
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
+
+    char* h_data = nullptr;
+    char* d_data = nullptr;
+    auto start = std::chrono::high_resolution_clock::now();
+    auto end = std::chrono::high_resolution_clock::now();
+    double elapsed_ms = 0;
+    int return_code = 0;
 
     try {
         // Create client
@@ -315,10 +336,13 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
+        const size_t SIZE = g_client->getTotalSize();
+        h_data = static_cast<char*>(g_client->getDataPointer());
+
         // Access and display memory content
-        const char* memory_data = static_cast<const char*>(g_client->getDataPointer());
+        const int* memory_data = static_cast<const int*>(g_client->getDataPointer());
         std::cout << "Memory content preview: ";
-        for (int i = 0; i < std::min(50, static_cast<int>(g_client->getTotalSize())); ++i) {
+        for (size_t i = 0; i < std::min<size_t>(50, SIZE / sizeof(int)); ++i) {
             if (std::isprint(memory_data[i])) {
                 std::cout << memory_data[i];
             } else {
@@ -330,11 +354,25 @@ int main(int argc, char* argv[]) {
         // Print memory sample
         g_client->printMemorySample();
 
+        CHECK(cudaMalloc((void**)&d_data, SIZE));
+        CHECK(cudaMemcpy(d_data, h_data, allocation_size, cudaMemcpyHostToDevice));
+
+        start = std::chrono::high_resolution_clock::now();
+        CHECK(cudaMemcpy(d_data, h_data, allocation_size, cudaMemcpyHostToDevice));
+        CHECK(cudaDeviceSynchronize());
+        end = std::chrono::high_resolution_clock::now();
+
+        elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+        std::cout << "H2D latency: " << elapsed_ms << " ms, "
+                << (allocation_size / (1 << 30)) / (elapsed_ms / 1e3) << " GB/s" << std::endl;
+
         // Wait for user input
         std::cout << "\nPress Enter to free shared memory and exit..." << std::endl;
         std::cin.get();
 
         // Free memory
+cleanup:
+        if (d_data) cudaFree(d_data);
         std::cout << "Freeing shared memory..." << std::endl;
         g_client->freeMemory();
 

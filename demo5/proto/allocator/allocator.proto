@@ -18,12 +18,12 @@ message MemoryReply {
 }
 
 message ChunkInfo {
-    int32 offset = 1;
+    uint64 offset = 1;
     uint64 size = 2;
 }
 
 message FreeRequest {
-    repeated int32 offset = 1;
+    repeated uint64 offset = 1;
 }
 
 message FreeReply {
