@@ -355,16 +355,16 @@ int main(int argc, char* argv[]) {
         g_client->printMemorySample();
 
         CHECK(cudaMalloc((void**)&d_data, SIZE));
-        CHECK(cudaMemcpy(d_data, h_data, allocation_size, cudaMemcpyHostToDevice));
+        CHECK(cudaMemcpy(d_data, h_data, SIZE, cudaMemcpyHostToDevice));
 
         start = std::chrono::high_resolution_clock::now();
-        CHECK(cudaMemcpy(d_data, h_data, allocation_size, cudaMemcpyHostToDevice));
+        CHECK(cudaMemcpy(d_data, h_data, SIZE, cudaMemcpyHostToDevice));
         CHECK(cudaDeviceSynchronize());
         end = std::chrono::high_resolution_clock::now();
 
         elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
         std::cout << "H2D latency: " << elapsed_ms << " ms, "
-                << (allocation_size / (1 << 30)) / (elapsed_ms / 1e3) << " GB/s" << std::endl;
+                << (SIZE / (1 << 30)) / (elapsed_ms / 1e3) << " GB/s" << std::endl;
 
         // Wait for user input
         std::cout << "\nPress Enter to free shared memory and exit..." << std::endl;
