@@ -3,15 +3,11 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <thread>
-#include <cstring>
 #include <signal.h>
 #include <vector>
 #include <string>
-#include <dirent.h>
 #include <sys/types.h>
-#include <fstream>
 #include <unordered_map>
-#include <sys/stat.h>
 #include <uuid/uuid.h>
 #include <grpcpp/grpcpp.h>
 #include <cuda_runtime_api.h>
@@ -24,37 +20,114 @@ using allocator::v1::MemoryRequest;
 using allocator::v1::MemoryReply;
 using allocator::v1::FreeRequest;
 using allocator::v1::FreeReply;
-using allocator::v1::ChunkInfo;
 
 // Configuration constants
 namespace Config {
-    constexpr size_t PAGE_SIZE = 4 * 1024 * 1024;     // 4 MB Pages
-    constexpr size_t POOL_SIZE = 5ULL * 1024 * 1024 * 1024;   // 5 GB pool
-    constexpr const char* POOL_SHM_NAME = "/memory_pool_main";
+    constexpr size_t SEGMENT_SIZE = 4 * 1024 * 1024;     // 4 MB per segment
+    constexpr size_t TOTAL_POOL_SIZE = 10ULL * 1024 * 1024 * 1024;   // 10 GB total
+    constexpr size_t NUM_SEGMENTS = TOTAL_POOL_SIZE / SEGMENT_SIZE;   // Number of segments
     constexpr const char* SERVER_ADDRESS = "0.0.0.0:50051";
+    constexpr const char* SHM_PREFIX = "/allocator_seg_";
     constexpr int SLEEP_INTERVAL_MS = 200;
 }
 
-// Memory block structure
-struct MemoryBlock {
-    size_t offset;
-    size_t size;
+// Memory segment structure
+struct MemorySegment {
+    std::string shm_name;
+    int fd;
+    void* base_ptr;
+    bool is_free;
+    size_t segment_id;
     
-    MemoryBlock(size_t off, size_t sz) : offset(off), size(sz) {}
+    MemorySegment(size_t id) : segment_id(id), fd(-1), base_ptr(nullptr), is_free(true) {
+        uuid_t uuid;
+        uuid_generate(uuid);
+        char shm_name_array[37]; // 36 characters + null terminator
+        uuid_unparse(uuid, shm_name_array);
+        shm_name = std::string(Config::SHM_PREFIX) + shm_name_array;
+    }
     
-    bool operator<(const MemoryBlock& other) const {
-        return offset < other.offset;
+    ~MemorySegment() {
+        cleanup();
+    }
+    
+    bool initialize() {
+        fd = shm_open(shm_name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0640);
+        if (fd == -1) {
+            perror(("shm_open failed for " + shm_name).c_str());
+            return false;
+        }
+        
+        if (ftruncate(fd, Config::SEGMENT_SIZE) == -1) {
+            perror("ftruncate failed");
+            cleanup();
+            return false;
+        }
+        
+        base_ptr = mmap(nullptr, Config::SEGMENT_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (base_ptr == MAP_FAILED) {
+            perror("mmap failed");
+            cleanup();
+            return false;
+        }
+        
+        // Register with CUDA for pinned memory
+        cudaError_t cuda_err = cudaHostRegister(base_ptr, Config::SEGMENT_SIZE, cudaHostRegisterDefault);
+        if (cuda_err != cudaSuccess) {
+            std::cerr << "cudaHostRegister failed for segment " << segment_id 
+                      << ": " << cudaGetErrorString(cuda_err) << std::endl;
+            cleanup();
+            return false;
+        }
+        
+        // Initialize memory with test pattern
+        initializeMemoryPattern();
+        
+        return true;
+    }
+    
+    void cleanup() {
+        if (base_ptr && base_ptr != MAP_FAILED) {
+            cudaError_t cuda_err = cudaHostUnregister(base_ptr);
+            if (cuda_err != cudaSuccess) {
+                std::cerr << "cudaHostUnregister failed for segment " << segment_id 
+                          << ": " << cudaGetErrorString(cuda_err) << std::endl;
+            }
+            
+            if (munmap(base_ptr, Config::SEGMENT_SIZE) == -1) {
+                perror(("munmap failed for segment " + std::to_string(segment_id)).c_str());
+            }
+            base_ptr = nullptr;
+        }
+        
+        if (fd >= 0) {
+            close(fd);
+            fd = -1;
+        }
+        
+        if (shm_unlink(shm_name.c_str()) == -1) {
+            perror(("shm_unlink failed for " + shm_name).c_str());
+        }
+    }
+    
+private:
+    void initializeMemoryPattern() {
+        uint32_t* ptr = reinterpret_cast<uint32_t*>(base_ptr);
+        size_t count = Config::SEGMENT_SIZE / sizeof(uint32_t);
+        
+        for (size_t i = 0; i < count; ++i) {
+            ptr[i] = static_cast<uint32_t>(segment_id * count + i);
+        }
     }
 };
 
 class SharedMemoryPool {
 private:
-    char* pool_base_;
-    int pool_fd_;
+    std::vector<std::unique_ptr<MemorySegment>> segments_;
     bool initialized_;
-
-    public:
-    SharedMemoryPool() : pool_base_(nullptr), pool_fd_(-1), initialized_(false) {}
+    
+public:
+    SharedMemoryPool() : initialized_(false) {}
     
     ~SharedMemoryPool() {
         cleanup();
@@ -70,43 +143,25 @@ private:
             return false;
         }
         
-        std::cout << "Initializing memory pool..." << std::endl;
+        std::cout << "Initializing memory pool with " << Config::NUM_SEGMENTS 
+                  << " segments of " << Config::SEGMENT_SIZE / (1024 * 1024) << "MB each..." << std::endl;
         
-        pool_fd_ = shm_open(Config::POOL_SHM_NAME, O_CREAT | O_EXCL | O_RDWR, 0640);
-        if (pool_fd_ == -1) {
-            perror("shm_open failed");
-            return false;
+        segments_.reserve(Config::NUM_SEGMENTS);
+        
+        for (size_t i = 0; i < Config::NUM_SEGMENTS; ++i) {
+            auto segment = std::make_unique<MemorySegment>(i);
+            if (!segment->initialize()) {
+                std::cerr << "Failed to initialize segment " << i << std::endl;
+                cleanup();
+                return false;
+            }
+            segments_.push_back(std::move(segment));
         }
-        
-        if (ftruncate(pool_fd_, Config::POOL_SIZE) == -1) {
-            perror("ftruncate failed");
-            cleanup();
-            return false;
-        }
-        
-        pool_base_ = static_cast<char*>(mmap(nullptr, Config::POOL_SIZE, 
-                                           PROT_READ | PROT_WRITE,
-                                           MAP_SHARED | MAP_LOCKED, pool_fd_, 0));
-        if (pool_base_ == MAP_FAILED) {
-            perror("mmap failed");
-            cleanup();
-            return false;
-        }
-        
-        cudaError_t cuda_err = cudaHostRegister(pool_base_, Config::POOL_SIZE, 
-                                               cudaHostRegisterDefault);
-        if (cuda_err != cudaSuccess) {
-            std::cerr << "cudaHostRegister failed: " << cudaGetErrorString(cuda_err) << std::endl;
-            cleanup();
-            return false;
-        }
-        
-        // Initialize memory with test pattern
-        initializeMemoryPattern();
         
         initialized_ = true;
-        std::cout << "Memory pool initialized successfully at address " 
-                  << static_cast<void*>(pool_base_) << std::endl;
+        std::cout << "Memory pool initialized successfully with " << segments_.size() 
+                  << " segments (" << (segments_.size() * Config::SEGMENT_SIZE) / (1024 * 1024) 
+                  << "MB total)" << std::endl;
         
         return true;
     }
@@ -114,66 +169,35 @@ private:
     void cleanup() {
         if (!initialized_) return;
         
-        std::cout << "Cleaning up shared memory..." << std::endl;
+        std::cout << "Cleaning up shared memory pool..." << std::endl;
         
-        if (pool_base_ && pool_base_ != MAP_FAILED) {
-            cudaError_t cuda_err = cudaHostUnregister(pool_base_);
-            if (cuda_err != cudaSuccess) {
-                std::cerr << "cudaHostUnregister failed: " 
-                          << cudaGetErrorString(cuda_err) << std::endl;
-            }
-            
-            if (munmap(pool_base_, Config::POOL_SIZE) == -1) {
-                perror("munmap failed");
-            }
-            pool_base_ = nullptr;
-        }
-        
-        if (pool_fd_ >= 0) {
-            close(pool_fd_);
-            pool_fd_ = -1;
-        }
-        
-        if (shm_unlink(Config::POOL_SHM_NAME) == -1) {
-            perror("shm_unlink failed");
-        }
+        segments_.clear(); // This will call destructors which handle cleanup
         
         initialized_ = false;
-        std::cout << "Shared memory cleanup completed" << std::endl;
+        std::cout << "Shared memory pool cleanup completed" << std::endl;
     }
     
-    char* getBase() const { return pool_base_; }
+    const std::vector<std::unique_ptr<MemorySegment>>& getSegments() const {
+        return segments_;
+    }
+    
     bool isInitialized() const { return initialized_; }
-    
-private:
-    void initializeMemoryPattern() {
-        uint32_t* ptr = reinterpret_cast<uint32_t*>(pool_base_);
-        size_t count = Config::POOL_SIZE / sizeof(uint32_t);
-        
-        for (size_t i = 0; i < count; ++i) {
-            ptr[i] = static_cast<uint32_t>(i);
-        }
-    }
 };
-
 
 // Memory allocator class
 class MemoryAllocator {
 private:
-    std::vector<MemoryBlock> free_blocks_;
-    std::unordered_map<size_t, size_t> allocation_map_;
-    size_t occupied_memory_;
+    SharedMemoryPool& memory_pool_;
+    std::unordered_map<std::string, size_t> allocated_segments_; // shm_name -> segment_id
+    size_t allocated_count_;
     mutable std::mutex mutex_;
     
 public:
-    MemoryAllocator() : occupied_memory_(0) {
-        // Initialize with one free block covering the entire pool
-        free_blocks_.emplace_back(0, Config::POOL_SIZE);
-    }
+    MemoryAllocator(SharedMemoryPool& pool) : memory_pool_(pool), allocated_count_(0) {}
     
     struct AllocationResult {
         bool success;
-        std::vector<MemoryBlock> chunks;
+        std::vector<std::string> shm_names;
         std::string error_message;
     };
     
@@ -184,171 +208,99 @@ public:
             return {false, {}, "Size must be positive"};
         }
         
-        size_t aligned_size = alignSize(requested_size);
+        // Calculate number of segments needed
+        size_t segments_needed = (requested_size + Config::SEGMENT_SIZE - 1) / Config::SEGMENT_SIZE;
         
-        if (occupied_memory_ + aligned_size > Config::POOL_SIZE) {
-            return {false, {}, "Not enough memory in pool after alignment"};
+        std::cout << "Allocating " << segments_needed << " segments for " 
+                  << requested_size / (1024 * 1024) << "MB request" << std::endl;
+        
+        const auto& segments = memory_pool_.getSegments();
+        
+        // Check if we have enough free segments
+        size_t available_segments = 0;
+        for (const auto& segment : segments) {
+            if (segment->is_free) {
+                available_segments++;
+            }
         }
         
-        std::cout << "Allocating " << aligned_size / (1024 * 1024) << "MB (aligned from " 
-                  << requested_size << " bytes)" << std::endl;
-        
-        // Try to find a single block that fits
-        auto single_block = findSingleBlock(aligned_size);
-        if (single_block.success) {
-            return single_block;
+        if (available_segments < segments_needed) {
+            return {false, {}, "Not enough free segments available"};
         }
         
-        // Try to allocate from multiple blocks
-        auto multi_block = allocateMultipleBlocks(aligned_size);
-        if (multi_block.success) {
-            return multi_block;
+        // Allocate segments
+        AllocationResult result;
+        result.success = true;
+        
+        size_t allocated = 0;
+        for (const auto& segment : segments) {
+            if (segment->is_free && allocated < segments_needed) {
+                segment->is_free = false;
+                result.shm_names.push_back(segment->shm_name);
+                allocated_segments_[segment->shm_name] = segment->segment_id;
+                allocated++;
+                
+                std::cout << "Allocated segment " << segment->segment_id 
+                          << " (shm_name: " << segment->shm_name << ")" << std::endl;
+            }
         }
         
-        return {false, {}, "Failed to allocate memory"};
+        allocated_count_ += allocated;
+        
+        std::cout << "Successfully allocated " << allocated << " segments ("
+                  << allocated * Config::SEGMENT_SIZE / (1024 * 1024) << "MB total)" << std::endl;
+        
+        printDebugInfo();
+        return result;
     }
     
-    bool deallocate(const std::vector<size_t>& offsets) {
+    bool deallocate(const std::vector<std::string>& shm_names) {
         std::lock_guard<std::mutex> lock(mutex_);
         
-        for (size_t offset : offsets) {
-            if (offset >= Config::POOL_SIZE || offset < 0) {
-                std::cerr << "Invalid offset: " << offset << std::endl;
+        const auto& segments = memory_pool_.getSegments();
+        
+        for (const std::string& shm_name : shm_names) {
+            auto it = allocated_segments_.find(shm_name);
+            if (it == allocated_segments_.end()) {
+                std::cerr << "Shared memory name not found in allocation map: " << shm_name << std::endl;
                 return false;
             }
             
-            auto it = allocation_map_.find(offset);
-            if (it == allocation_map_.end()) {
-                std::cerr << "Offset not found in allocation map: " << offset << std::endl;
+            size_t segment_id = it->second;
+            if (segment_id >= segments.size()) {
+                std::cerr << "Invalid segment ID: " << segment_id << std::endl;
                 return false;
             }
             
-            size_t block_size = it->second;
-            occupied_memory_ -= block_size;
-            allocation_map_.erase(it);
-            free_blocks_.emplace_back(offset, block_size);
+            segments[segment_id]->is_free = true;
+            allocated_segments_.erase(it);
+            allocated_count_--;
             
-            std::cout << "Freed memory block: offset=" << offset 
-                      << ", size=" << block_size / (1024 * 1024) << "MB" << std::endl;
+            std::cout << "Freed segment " << segment_id 
+                      << " (shm_name: " << shm_name << ")" << std::endl;
         }
         
-        mergeAdjacentBlocks();
         printDebugInfo();
-        
         return true;
     }
     
     void printDebugInfo() const {
-        std::cout << "Free blocks: ";
-        for (const auto& block : free_blocks_) {
-            std::cout << "{offset=" << block.offset 
-                      << ", size=" << block.size / (1024 * 1024) << "MB} ";
-        }
-        std::cout << std::endl;
+        const auto& segments = memory_pool_.getSegments();
         
-        std::cout << "Allocated blocks: ";
-        for (const auto& [offset, size] : allocation_map_) {
-            std::cout << "{offset=" << offset 
-                      << ", size=" << size / (1024 * 1024) << "MB} ";
-        }
-        std::cout << std::endl;
-        
-        std::cout << "Memory usage: " << occupied_memory_ / (1024 * 1024) 
-                  << "MB / " << Config::POOL_SIZE / (1024 * 1024) << "MB" << std::endl;
-    }
-    
-private:
-    static size_t alignSize(size_t size) {
-        return ((size + Config::PAGE_SIZE - 1) / Config::PAGE_SIZE) * Config::PAGE_SIZE;
-    }
-    
-    AllocationResult findSingleBlock(size_t aligned_size) {
-        for (auto it = free_blocks_.begin(); it != free_blocks_.end(); ++it) {
-            if (it->size >= aligned_size) {
-                AllocationResult result;
-                result.success = true;
-                result.chunks.emplace_back(it->offset, aligned_size);
-                
-                // Track allocation
-                allocation_map_[it->offset] = aligned_size;
-                occupied_memory_ += aligned_size;
-                
-                // Update or remove the free block
-                if (it->size == aligned_size) {
-                    free_blocks_.erase(it);
-                } else {
-                    it->offset += aligned_size;
-                    it->size -= aligned_size;
-                }
-                
-                std::cout << "Allocated single block: offset=" << result.chunks[0].offset
-                          << ", size=" << aligned_size / (1024 * 1024) << "MB" << std::endl;
-                
-                return result;
+        std::cout << "Segment allocation status:" << std::endl;
+        size_t free_count = 0;
+        for (const auto& segment : segments) {
+            if (segment->is_free) {
+                free_count++;
             }
         }
         
-        return {false, {}, "No single block large enough"};
-    }
-    
-    AllocationResult allocateMultipleBlocks(size_t aligned_size) {
-        AllocationResult result;
-        size_t remaining_size = aligned_size;
-        
-        auto it = free_blocks_.begin();
-        while (remaining_size > 0 && it != free_blocks_.end()) {
-            size_t chunk_size = std::min(it->size, remaining_size);
-            
-            result.chunks.emplace_back(it->offset, chunk_size);
-            allocation_map_[it->offset] = chunk_size;
-            occupied_memory_ += chunk_size;
-            
-            remaining_size -= chunk_size;
-            it->offset += chunk_size;
-            it->size -= chunk_size;
-            
-            if (it->size == 0) {
-                it = free_blocks_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        
-        if (remaining_size == 0) {
-            result.success = true;
-            std::cout << "Allocated " << result.chunks.size() << " chunks totaling "
-                      << aligned_size / (1024 * 1024) << "MB" << std::endl;
-        } else {
-            result.success = false;
-            result.error_message = "Insufficient memory in free blocks";
-            
-            // Rollback partial allocation
-            for (const auto& chunk : result.chunks) {
-                allocation_map_.erase(chunk.offset);
-                occupied_memory_ -= chunk.size;
-                free_blocks_.emplace_back(chunk.offset, chunk.size);
-            }
-            result.chunks.clear();
-        }
-        
-        return result;
-    }
-    
-    void mergeAdjacentBlocks() {
-        if (free_blocks_.size() < 2) return;
-        
-        std::sort(free_blocks_.begin(), free_blocks_.end());
-        
-        for (size_t i = 0; i < free_blocks_.size() - 1; ++i) {
-            if (free_blocks_[i].offset + free_blocks_[i].size == free_blocks_[i + 1].offset) {
-                free_blocks_[i].size += free_blocks_[i + 1].size;
-                free_blocks_.erase(free_blocks_.begin() + i + 1);
-                --i; // Re-check the merged block
-            }
-        }
+        std::cout << "  Free segments: " << free_count << " / " << segments.size() << std::endl;
+        std::cout << "  Allocated segments: " << allocated_count_ << " / " << segments.size() << std::endl;
+        std::cout << "  Memory usage: " << (allocated_count_ * Config::SEGMENT_SIZE) / (1024 * 1024) 
+                  << "MB / " << (segments.size() * Config::SEGMENT_SIZE) / (1024 * 1024) << "MB" << std::endl;
     }
 };
-
 
 // gRPC service implementation
 class AllocatorServiceImpl : public allocator::v1::Allocator::Service {
@@ -356,6 +308,8 @@ private:
     MemoryAllocator allocator_;
     
 public:
+    AllocatorServiceImpl(SharedMemoryPool& pool) : allocator_(pool) {}
+    
     grpc::Status AllocateMemory(grpc::ServerContext* context,
                                const allocator::v1::MemoryRequest* request,
                                allocator::v1::MemoryReply* response) override {
@@ -369,43 +323,35 @@ public:
             return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, result.error_message);
         }
         
-        // Populate response
-        response->set_shm_name(Config::POOL_SHM_NAME);
-        size_t total_size = 0;
-        
-        for (const auto& chunk : result.chunks) {
-            auto* chunk_info = response->add_chunks();
-            chunk_info->set_offset(chunk.offset);
-            chunk_info->set_size(chunk.size);
-            total_size += chunk.size;
+        // Populate response with multiple shm_names
+        for (const std::string& shm_name : result.shm_names) {
+            response->add_shm_names(shm_name);    
         }
+        response->set_page_size(Config::SEGMENT_SIZE);
+        response->set_total_size(result.shm_names.size() * Config::SEGMENT_SIZE);
         
-        response->set_total_size(total_size);
-        
-        allocator_.printDebugInfo();
         return grpc::Status::OK;
     }
     
     grpc::Status FreeSharedMemory(grpc::ServerContext* context,
                                  const allocator::v1::FreeRequest* request,
                                  allocator::v1::FreeReply* response) override {
-        std::vector<size_t> offsets;
-        offsets.reserve(request->offset_size());
+        std::vector<std::string> shm_names;
         
-        for (size_t offset : request->offset()) {
-            offsets.push_back(offset);
+        // Extract shm_names from the request
+        for (const auto& shm_name : request->shm_names()) {
+            shm_names.push_back(shm_name);
         }
         
-        std::cout << "Received deallocation request for " << offsets.size() << " blocks" << std::endl;
+        std::cout << "Received deallocation request for " << shm_names.size() << " segments" << std::endl;
         
-        if (!allocator_.deallocate(offsets)) {
+        if (!allocator_.deallocate(shm_names)) {
             return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "Failed to deallocate memory");
         }
         
         return grpc::Status::OK;
     }
 };
-
 
 // Server management class
 class AllocatorServer {
@@ -426,7 +372,7 @@ public:
             return false;
         }
         
-        service_ = std::make_unique<AllocatorServiceImpl>();
+        service_ = std::make_unique<AllocatorServiceImpl>(memory_pool_);
         grpc::ServerBuilder builder;
         
         builder.AddListeningPort(Config::SERVER_ADDRESS, grpc::InsecureServerCredentials());
@@ -456,14 +402,7 @@ public:
             server_->Shutdown();
         }
     }
-    
-    void setSignalHandler() {
-        signal(SIGINT, [](int) {
-            std::cout << "\nReceived shutdown signal..." << std::endl;
-        });
-    }
 };
-
 
 // Global server instance for signal handling
 std::unique_ptr<AllocatorServer> g_server;

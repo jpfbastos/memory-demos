@@ -12,18 +12,13 @@ message MemoryRequest {
 }
 
 message MemoryReply {
-    string shm_name = 1;
-    repeated ChunkInfo chunks = 2;
+    uint64 page_size = 1;
+    repeated string shm_names = 2;
     uint64 total_size = 3;
 }
 
-message ChunkInfo {
-    uint64 offset = 1;
-    uint64 size = 2;
-}
-
 message FreeRequest {
-    repeated uint64 offset = 1;
+    repeated string shm_names = 1;
 }
 
 message FreeReply {
