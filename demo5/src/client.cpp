@@ -48,14 +48,14 @@ struct LocalChunkInfo {
     std::string shm_name;
     int shm_fd;
     void* ptr;
-    size_t page_size; 
+    size_t segment_size; 
 
-    LocalChunkInfo(const std::string& name, int fd, void* p, size_t ps) 
-        : shm_name(name), shm_fd(fd), ptr(p), page_size(ps) {}
+    LocalChunkInfo(const std::string& name, int fd, void* p, size_t ps)
+        : shm_name(name), shm_fd(fd), ptr(p), segment_size(ps) {}
 
     ~LocalChunkInfo() {
         if (ptr != nullptr && ptr != MAP_FAILED) {
-            munmap(ptr, page_size); 
+            munmap(ptr, segment_size);
         }
         if (shm_fd >= 0) {
             close(shm_fd);
@@ -68,7 +68,7 @@ class AllocatorClient {
 public:
     explicit AllocatorClient(std::shared_ptr<Channel> channel)
         : stub_(Allocator::NewStub(channel)),
-          page_size_(Config::DEFAULT_ALLOCATION_SIZE),  
+          segment_size_(Config::DEFAULT_ALLOCATION_SIZE),
           mapped_memory_(nullptr),
           total_size_(0),
           is_allocated_(false) {}
@@ -155,7 +155,7 @@ public:
 
 private:
     std::unique_ptr<Allocator::Stub> stub_;
-    size_t page_size_;
+    size_t segment_size_;
     void* mapped_memory_;
     size_t total_size_;
     std::vector<LocalChunkInfo> chunks_;
@@ -179,7 +179,7 @@ private:
             return false;
         }
 
-        page_size_ = reply.page_size();
+        segment_size_ = reply.segment_size();
         total_size_ = reply.total_size();
         
         // Store chunk information
@@ -190,7 +190,7 @@ private:
                 shm_name.c_str(),
                 -1,  // shm_fd will be set later
                 nullptr,  // ptr will be set after mapping
-                page_size_
+                segment_size_
             );
         }
         
@@ -232,7 +232,7 @@ private:
 
             void* chunk_ptr = mmap(
                 static_cast<char*>(mapped_memory_) + virtual_offset,
-                page_size_,
+                segment_size_,
                 PROT_READ | PROT_WRITE,
                 MAP_SHARED | MAP_FIXED,
                 shm_fd,
@@ -245,7 +245,7 @@ private:
             }
 
             chunk_info.ptr = chunk_ptr;
-            virtual_offset += page_size_;
+            virtual_offset += segment_size_;
         }
 
         return true;

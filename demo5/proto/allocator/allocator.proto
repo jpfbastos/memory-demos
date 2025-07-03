@@ -12,7 +12,7 @@ message MemoryRequest {
 }
 
 message MemoryReply {
-    uint64 page_size = 1;
+    uint64 segment_size = 1;
     repeated string shm_names = 2;
     uint64 total_size = 3;
 }

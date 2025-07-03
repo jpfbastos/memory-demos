@@ -327,7 +327,7 @@ public:
         for (const std::string& shm_name : result.shm_names) {
             response->add_shm_names(shm_name);    
         }
-        response->set_page_size(Config::SEGMENT_SIZE);
+        response->set_segment_size(Config::SEGMENT_SIZE);
         response->set_total_size(result.shm_names.size() * Config::SEGMENT_SIZE);
         
         return grpc::Status::OK;
