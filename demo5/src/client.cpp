@@ -19,10 +19,20 @@ using allocator::v1::FreeRequest;
 using allocator::v1::FreeReply;
 using allocator::v1::ChunkInfo;
 
+// Configuration constants
+namespace Config {
+    constexpr const char* DEFAULT_SERVER_ADDRESS = "localhost:50051";
+    constexpr size_t DEFAULT_ALLOCATION_SIZE = 4 * 1024 * 1024;  // 4MB
+    constexpr size_t SAMPLE_STEP_SIZE = 4 * 1024 * 1024;         // 4MB step for sampling
+}
+
+// Represents a locally mapped chunk of shared memory
 struct LocalChunkInfo {
-    void* ptr;  // Pointer to the mapped chunk
-    size_t size;  // Size of the chunk
-    off_t offset;  // Offset in the shared memory pool
+    void* ptr;
+    size_t size;
+    off_t offset;
+    
+    LocalChunkInfo(void* p, size_t s, off_t o) : ptr(p), size(s), offset(o) {}
 };
 
 class AllocatorClient {
@@ -30,13 +40,100 @@ public:
     explicit AllocatorClient(std::shared_ptr<Channel> channel)
         : stub_(Allocator::NewStub(channel)),
           shm_fd_(-1),
-          h_data_(nullptr),
+          mapped_memory_(nullptr),
           total_size_(0),
-          offset_(-1) {}
+          is_allocated_(false) {}
 
-    // Requests shared memory of 'size' bytes from the server,
-    // maps it locally, and returns true on success.
-    bool AllocateMemory(size_t size = 1) {
+    ~AllocatorClient() {
+        cleanup();
+    }
+
+    // Delete copy constructor and assignment operator
+    AllocatorClient(const AllocatorClient&) = delete;
+    AllocatorClient& operator=(const AllocatorClient&) = delete;
+
+    bool allocateMemory(size_t size) {
+        if (is_allocated_) {
+            std::cerr << "Memory already allocated. Free existing allocation first." << std::endl;
+            return false;
+        }
+
+        if (!requestMemoryFromServer(size)) {
+            return false;
+        }
+
+        if (!mapSharedMemory()) {
+            cleanup();
+            return false;
+        }
+
+        is_allocated_ = true;
+        std::cout << "Successfully allocated and mapped " << total_size_ 
+                  << " bytes in " << chunks_.size() << " chunks" << std::endl;
+        return true;
+    }
+
+    bool freeMemory() {
+        if (!is_allocated_) {
+            std::cerr << "No memory allocated to free" << std::endl;
+            return false;
+        }
+
+        bool success = true;
+        
+        // Notify server to free memory
+        if (!freeMemoryOnServer()) {
+            std::cerr << "Failed to free memory on server" << std::endl;
+            success = false;
+        }
+
+        // Clean up local mappings regardless of server response
+        cleanup();
+        
+        std::cout << "Memory freed successfully" << std::endl;
+        return success;
+    }
+
+    void* getDataPointer() const {
+        return mapped_memory_;
+    }
+
+    size_t getTotalSize() const {
+        return total_size_;
+    }
+
+    bool isAllocated() const {
+        return is_allocated_;
+    }
+
+    void printMemorySample() const {
+        if (!is_allocated_ || !mapped_memory_) {
+            std::cout << "No memory allocated to sample" << std::endl;
+            return;
+        }
+
+        const uint32_t* data = static_cast<const uint32_t*>(mapped_memory_);
+        size_t total_elements = total_size_ / sizeof(uint32_t);
+        size_t step = Config::SAMPLE_STEP_SIZE / sizeof(uint32_t);
+
+        std::cout << "Memory sample (every " << Config::SAMPLE_STEP_SIZE / (1024 * 1024) 
+                  << "MB):" << std::endl;
+        
+        for (size_t i = 0; i < total_elements; i += step) {
+            std::cout << "  Offset " << i << ": " << data[i] << std::endl;
+        }
+    }
+
+private:
+    std::unique_ptr<Allocator::Stub> stub_;
+    int shm_fd_;
+    void* mapped_memory_;
+    size_t total_size_;
+    std::string shm_name_;
+    std::vector<LocalChunkInfo> chunks_;
+    bool is_allocated_;
+
+    bool requestMemoryFromServer(size_t size) {
         MemoryRequest request;
         MemoryReply reply;
         ClientContext context;
@@ -45,181 +142,208 @@ public:
 
         Status status = stub_->AllocateMemory(&context, request, &reply);
         if (!status.ok()) {
-            std::cerr << "gRPC request failed: " << status.error_message() << std::endl;
+            std::cerr << "gRPC allocation request failed: " << status.error_message() << std::endl;
             return false;
         }
 
         if (reply.chunks().empty() || reply.total_size() == 0) {
-            std::cerr << "Failed to get valid memory allocation\n";
+            std::cerr << "Server returned invalid memory allocation" << std::endl;
             return false;
         }
 
         shm_name_ = reply.shm_name();
         total_size_ = reply.total_size();
-        offset_ = reply.chunks(0).offset();
+        
+        // Store chunk information
+        chunks_.clear();
+        chunks_.reserve(reply.chunks().size());
+        for (const auto& chunk : reply.chunks()) {
+            chunks_.emplace_back(nullptr, chunk.size(), chunk.offset());
+        }
+        
+        return true;
+    }
 
+    bool mapSharedMemory() {
         // Open shared memory segment
         shm_fd_ = shm_open(shm_name_.c_str(), O_RDWR, 0640);
         if (shm_fd_ == -1) {
-            perror("shm_open");
+            perror("shm_open failed");
             return false;
         }
 
-        // Step 1: Reserve contiguous virtual address space
-        h_data_ = mmap(nullptr, total_size_, PROT_NONE, 
+        // Reserve contiguous virtual address space
+        mapped_memory_ = mmap(nullptr, total_size_, PROT_NONE, 
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (h_data_ == MAP_FAILED) {
+        if (mapped_memory_ == MAP_FAILED) {
             perror("Failed to reserve virtual address space");
             close(shm_fd_);
             shm_fd_ = -1;
             return false;
         }
 
-        // Step 2: Map each chunk into the reserved space
-        size_t virtual_offset = 0;
-        for (const auto& chunk_info : reply.chunks()) {
-            std::cout << "Mapping chunk at offset " << chunk_info.offset() 
-                      << " with size " << chunk_info.size() << std::endl;
-            void* chunk_ptr = mmap(
-                static_cast<char*>(h_data_) + virtual_offset,  // Fixed position
-                chunk_info.size(),
-                PROT_READ | PROT_WRITE,
-                MAP_SHARED | MAP_FIXED,
-                shm_fd_,
-                chunk_info.offset()  // Pool offset
-            );
-
-            if (chunk_ptr == MAP_FAILED) {
-                perror("Failed to map chunk");
-                munmap(h_data_, total_size_);
-                close(shm_fd_);
-                shm_fd_ = -1;
-                h_data_ = nullptr;
-                total_size_ = 0;
-                shm_name_.clear();
-                chunks_.clear();
-                return false;
-            }
-
-            chunks_.push_back({chunk_ptr, chunk_info.size(), chunk_info.offset()});
-            virtual_offset += chunk_info.size();
+        // Map each chunk into the reserved space
+        if (!mapChunks()) {
+            unmapMemory();
+            return false;
         }
-
-        std::cout << "Client mapped " << chunks_.size() << " chunks totaling " 
-                  << total_size_ << " bytes at " << h_data_ << std::endl;
 
         return true;
     }
 
-    // Frees the shared memory allocation on server and unmaps locally
-    bool FreeSharedMemory() {
-        if (shm_fd_ == -1 || h_data_ == nullptr) {
-            std::cerr << "No shared memory mapped to free.\n";
-            return false;
+    bool mapChunks() {
+        size_t virtual_offset = 0;
+        
+        for (const auto& chunk_info : chunks_) {
+            void* chunk_ptr = mmap(
+                static_cast<char*>(mapped_memory_) + virtual_offset,
+                chunk_info.size,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED | MAP_FIXED,
+                shm_fd_,
+                chunk_info.offset
+            );
+
+            if (chunk_ptr == MAP_FAILED) {
+                perror("Failed to map chunk");
+                return false;
+            }
+
+            virtual_offset += chunk_info.size;
         }
 
+
+        return true;
+    }
+
+    bool freeMemoryOnServer() {
         FreeRequest request;
         FreeReply reply;
         ClientContext context;
 
         for (const auto& chunk : chunks_) {
-            request.add_offset(chunk.offset);  // Add each chunk's offset
+            request.add_offset(chunk.offset);
         }
 
         Status status = stub_->FreeSharedMemory(&context, request, &reply);
-        if (!status.ok()) {
-            std::cerr << "gRPC free request failed: " << status.error_message() << std::endl;
-            return false;
+        return status.ok();
+    }
+
+    void unmapMemory() {
+        if (mapped_memory_ && mapped_memory_ != MAP_FAILED) {
+            if (munmap(mapped_memory_, total_size_) == -1) {
+                perror("munmap failed");
+            }
+            mapped_memory_ = nullptr;
         }
 
-        // Unmap and close local mapping
-        if (munmap(h_data_, total_size_) == -1) {
-            perror("munmap");
+        if (shm_fd_ >= 0) {
+            close(shm_fd_);
+            shm_fd_ = -1;
         }
-        close(shm_fd_);
+    }
 
-        // Reset members to safe state
-        h_data_ = nullptr;
-        shm_fd_ = -1;
+    void cleanup() {
+        unmapMemory();
+        
         total_size_ = 0;
-        offset_ = -1;
         shm_name_.clear();
-
-        std::cout << "Shared memory freed and unmapped successfully.\n";
-        return true;
+        chunks_.clear();
+        is_allocated_ = false;
     }
-
-    // Accessor for the mapped memory pointer
-    void* getDataPointer() const {
-        return h_data_;
-    }
-
-    size_t getTotalSize() const {
-        return total_size_;
-    }
-
-private:
-    std::unique_ptr<Allocator::Stub> stub_;
-
-    int shm_fd_;
-    void* h_data_;
-    size_t total_size_;
-    off_t offset_;
-    std::string shm_name_;
-    std::vector<LocalChunkInfo> chunks_;
 };
 
-AllocatorClient* g_client_ptr = nullptr;
+// Global client pointer for signal handling
+std::unique_ptr<AllocatorClient> g_client;
 
-void sigint_handler(int signum) {
-    std::cout << "Received SIGINT. Cleaning up...\n";
-    if (g_client_ptr) {
-        g_client_ptr->FreeSharedMemory();
+void signalHandler(int signal) {
+    std::cout << "\nReceived signal " << signal << ", cleaning up..." << std::endl;
+    if (g_client && g_client->isAllocated()) {
+        g_client->freeMemory();
     }
-    std::cout << "Exiting program due to SIGINT.\n";
-    exit(1);
+    std::cout << "Exiting..." << std::endl;
+    exit(0);
 }
 
-int main(int argc, char *argv[]) {
-    AllocatorClient client(grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials()));
+void printUsage(const char* program_name) {
+    std::cout << "Usage: " << program_name << " [size_in_mb]" << std::endl;
+    std::cout << "Default size: " << Config::DEFAULT_ALLOCATION_SIZE / (1024 * 1024) << "MB" << std::endl;
+}
 
-    g_client_ptr = &client; // set global pointer
-
-    signal(SIGINT, sigint_handler);
-
-    int size = (argc > 1) ? std::stoi(argv[1]) * 1024 * 1024 : 4 * 1024 * 1024;
-
-    if (!client.AllocateMemory(size)) {
-        std::cerr << "Failed to request shared memory.\n";
+int parseSize(const char* arg) {
+    try {
+        int size_mb = std::stoi(arg);
+        if (size_mb <= 0) {
+            std::cerr << "Size must be positive" << std::endl;
+            return -1;
+        }
+        return size_mb * 1024 * 1024;
+    } catch (const std::exception& e) {
+        std::cerr << "Invalid size argument: " << arg << std::endl;
         return -1;
     }
+}
 
-    char* h_data = static_cast<char*>(client.getDataPointer());
-    size_t total_size = client.getTotalSize();
-
-    // Print message from server
-    std::cout << "Shared memory message: " << h_data << "\n";
-
-    uint32_t* data = reinterpret_cast<uint32_t*>(h_data);
-    size_t total_elements = total_size / sizeof(uint32_t);
-    size_t step = (4 * 1024 * 1024) / sizeof(uint32_t);  // 4MB step in uint32_t units
-
-    for (size_t i = 0; i < total_elements; i += step) {
-        std::cout << "Int at offset " << i << ": " << data[i] << std::endl;
+int main(int argc, char* argv[]) {
+    // Parse command line arguments
+    size_t allocation_size = Config::DEFAULT_ALLOCATION_SIZE;
+    if (argc > 1) {
+        int parsed_size = parseSize(argv[1]);
+        if (parsed_size < 0) {
+            printUsage(argv[0]);
+            return 1;
+        }
+        allocation_size = parsed_size;
     }
 
+    // Set up signal handling
+    signal(SIGINT, signalHandler);
+    signal(SIGTERM, signalHandler);
 
-    // wait for enter
-    std::cout << "Press Enter to free shared memory...\n";
-    std::cin.get();
+    try {
+        // Create client
+        auto channel = grpc::CreateChannel(Config::DEFAULT_SERVER_ADDRESS, 
+                                         grpc::InsecureChannelCredentials());
+        g_client = std::make_unique<AllocatorClient>(channel);
 
-    std::cout << "Freeing shared memory...\n";
+        // Allocate memory
+        std::cout << "Requesting " << allocation_size / (1024 * 1024) 
+                  << "MB of shared memory..." << std::endl;
+        
+        if (!g_client->allocateMemory(allocation_size)) {
+            std::cerr << "Failed to allocate shared memory" << std::endl;
+            return 1;
+        }
 
-    client.FreeSharedMemory();
+        // Access and display memory content
+        const char* memory_data = static_cast<const char*>(g_client->getDataPointer());
+        std::cout << "Memory content preview: ";
+        for (int i = 0; i < std::min(50, static_cast<int>(g_client->getTotalSize())); ++i) {
+            if (std::isprint(memory_data[i])) {
+                std::cout << memory_data[i];
+            } else {
+                break;
+            }
+        }
+        std::cout << std::endl;
 
-    std::cout << "Hello World" << std::endl; 
+        // Print memory sample
+        g_client->printMemorySample();
 
-    std::cout << "Shared memory message: " << h_data << "\n";
+        // Wait for user input
+        std::cout << "\nPress Enter to free shared memory and exit..." << std::endl;
+        std::cin.get();
+
+        // Free memory
+        std::cout << "Freeing shared memory..." << std::endl;
+        g_client->freeMemory();
+
+        std::cout << "Program completed successfully" << std::endl;
+
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
 
     return 0;
 }
