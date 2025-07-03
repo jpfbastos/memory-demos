@@ -29,7 +29,7 @@ using allocator::v1::ChunkInfo;
 // Configuration constants
 namespace Config {
     constexpr size_t PAGE_SIZE = 4 * 1024 * 1024;     // 4 MB Pages
-    constexpr size_t POOL_SIZE = 2ULL * 1024 * 1024 * 1024;   // 2 GB pool
+    constexpr size_t POOL_SIZE = 5ULL * 1024 * 1024 * 1024;   // 5 GB pool
     constexpr const char* POOL_SHM_NAME = "/memory_pool_main";
     constexpr const char* SERVER_ADDRESS = "0.0.0.0:50051";
     constexpr int SLEEP_INTERVAL_MS = 200;
