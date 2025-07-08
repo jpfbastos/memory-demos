@@ -43,32 +43,13 @@ namespace Config {
     constexpr size_t SAMPLE_STEP_SIZE = 4 * 1024 * 1024;         // 4MB step for sampling
 }
 
-// Represents a locally mapped chunk of shared memory
-struct LocalChunkInfo {
-    std::string shm_name;
-    int shm_fd;
-    void* ptr;
-    size_t segment_size; 
-
-    LocalChunkInfo(const std::string& name, int fd, void* p, size_t ps)
-        : shm_name(name), shm_fd(fd), ptr(p), segment_size(ps) {}
-
-    ~LocalChunkInfo() {
-        if (ptr != nullptr && ptr != MAP_FAILED) {
-            munmap(ptr, segment_size);
-        }
-        if (shm_fd >= 0) {
-            close(shm_fd);
-        }
-    }
-};
-
 
 class AllocatorClient {
 public:
     explicit AllocatorClient(std::shared_ptr<Channel> channel)
         : stub_(Allocator::NewStub(channel)),
-          segment_size_(Config::DEFAULT_ALLOCATION_SIZE),
+          shm_name_(""),
+          shm_fd_(-1),
           mapped_memory_(nullptr),
           total_size_(0),
           is_allocated_(false) {}
@@ -98,7 +79,7 @@ public:
 
         is_allocated_ = true;
         std::cout << "Successfully allocated and mapped " << total_size_ 
-                  << " bytes in " << chunks_.size() << " chunks" << std::endl;
+                  << " bytes" << std::endl;
         return true;
     }
 
@@ -155,10 +136,10 @@ public:
 
 private:
     std::unique_ptr<Allocator::Stub> stub_;
-    size_t segment_size_;
+    std::string shm_name_;
+    int shm_fd_;
     void* mapped_memory_;
     size_t total_size_;
-    std::vector<LocalChunkInfo> chunks_;
     bool is_allocated_;
 
     bool requestMemoryFromServer(size_t size) {
@@ -174,79 +155,40 @@ private:
             return false;
         }
 
-        if (reply.shm_names().empty() || reply.total_size() == 0) {
-            std::cerr << "Server returned invalid memory allocation" << std::endl;
+        if (reply.shm_name().empty() || reply.total_size() == 0) {
+            std::cerr << "Invalid allocation response from server" << std::endl;
             return false;
         }
 
-        segment_size_ = reply.segment_size();
+        shm_name_ = reply.shm_name();
         total_size_ = reply.total_size();
-        
-        // Store chunk information
-        chunks_.clear();
-        chunks_.reserve(reply.shm_names().size());
-        for (const auto& shm_name : reply.shm_names()) {
-            chunks_.emplace_back(
-                shm_name.c_str(),
-                -1,  // shm_fd will be set later
-                nullptr,  // ptr will be set after mapping
-                segment_size_
-            );
-        }
+        std::cout << "Allocated shared memory: " << shm_name_ 
+                  << ", size: " << total_size_ << " bytes" << std::endl;
         
         return true;
     }
 
     bool mapSharedMemory() {
 
-        // Reserve contiguous virtual address space
-        mapped_memory_ = mmap(nullptr, total_size_, PROT_NONE, 
-                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        shm_fd_ = shm_open(shm_name_.c_str(), O_RDWR, 0640);
+        if (shm_fd_ < 0) {
+            perror("Failed to open shared memory object");
+            return false;
+        }
+
+        // Reserve space for the entire allocation
+        mapped_memory_ = mmap(nullptr, total_size_, PROT_READ | PROT_WRITE,
+                              MAP_SHARED | MAP_LOCKED, shm_fd_, 0);
         if (mapped_memory_ == MAP_FAILED) {
-            perror("Failed to reserve virtual address space");
+            perror("Failed to map shared memory object");
+            close(shm_fd_);
+            shm_unlink(shm_name_.c_str());
             return false;
         }
 
-        // Map each chunk into the reserved space
-        if (!mapChunks()) {
-            unmapMemory();
-            return false;
-        }
-
-        return true;
-    }
-
-    bool mapChunks() {
-
-        size_t virtual_offset = 0;
-
-        for (auto& chunk_info : chunks_) {
-            // Open shared memory object
-            int shm_fd = shm_open(chunk_info.shm_name.c_str(), O_RDWR, 0640);
-            if (shm_fd < 0) {
-                perror("Failed to open shared memory object");
-                return false;
-            }
-
-            chunk_info.shm_fd = shm_fd;
-
-            void* chunk_ptr = mmap(
-                static_cast<char*>(mapped_memory_) + virtual_offset,
-                segment_size_,
-                PROT_READ | PROT_WRITE,
-                MAP_SHARED | MAP_FIXED,
-                shm_fd,
-                0
-            );
-
-            if (chunk_ptr == MAP_FAILED) {
-                perror("Failed to map chunk");
-                return false;
-            }
-
-            chunk_info.ptr = chunk_ptr;
-            virtual_offset += segment_size_;
-        }
+        const uint32_t* data = static_cast<const uint32_t*>(mapped_memory_);
+        std::cout << "Value at [0]: " << data[0] << std::endl;
+        std::cout << "Value at [1MB]: " << data[1024 * 256] << std::endl;
 
         return true;
     }
@@ -256,37 +198,33 @@ private:
         FreeReply reply;
         ClientContext context;
 
-        for (const auto& chunk : chunks_) {
-            request.add_shm_names(chunk.shm_name);
-        }
+        request.set_shm_name(shm_name_);
 
         Status status = stub_->FreeSharedMemory(&context, request, &reply);
         return status.ok();
     }
 
     void unmapMemory() {
-            // Clear chunks first to avoid double-free from destructors
-            for (auto& chunk : chunks_) {
-                if (chunk.shm_fd >= 0) {
-                    close(chunk.shm_fd);
-                    chunk.shm_fd = -1;
-                }
-                chunk.ptr = nullptr;
-            }
-
         if (mapped_memory_ && mapped_memory_ != MAP_FAILED) {
             if (munmap(mapped_memory_, total_size_) == -1) {
                 perror("munmap failed");
             }
             mapped_memory_ = nullptr;
         }
+
+        if (shm_fd_ >= 0) {
+            close(shm_fd_);
+            shm_fd_ = -1;
+        }
     }
 
     void cleanup() {
         unmapMemory();
         
+        shm_name_ = "";
+        shm_fd_ = -1;
+        mapped_memory_ = nullptr;
         total_size_ = 0;
-        chunks_.clear();
         is_allocated_ = false;
     }
 };
@@ -378,6 +316,8 @@ int main(int argc, char* argv[]) {
 
         // Print memory sample
         g_client->printMemorySample();
+
+        CHECK(cudaHostRegister(h_data, SIZE, cudaHostRegisterDefault));
 
         CHECK(cudaMalloc((void**)&d_data, SIZE));
         CHECK(cudaMemcpy(d_data, h_data, SIZE, cudaMemcpyHostToDevice));

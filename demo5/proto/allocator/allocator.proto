@@ -12,13 +12,12 @@ message MemoryRequest {
 }
 
 message MemoryReply {
-    uint64 segment_size = 1;
-    repeated string shm_names = 2;
-    uint64 total_size = 3;
+    string shm_name = 1;
+    uint64 total_size = 2;
 }
 
 message FreeRequest {
-    repeated string shm_names = 1;
+    string shm_name = 1;
 }
 
 message FreeReply {

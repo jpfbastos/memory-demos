@@ -32,7 +32,7 @@ int main() {
     int return_code = 0;
 
     // Open shared memory object
-    int shm_fd = shm_open(SHM_NAME, O_RDONLY, 0640);
+    int shm_fd = shm_open(SHM_NAME, O_RDWR, 0640);
     if (shm_fd == -1) {
         perror("shm_open");
         return 1;
@@ -41,8 +41,7 @@ int main() {
     size_t page_size = sysconf(_SC_PAGESIZE);
     size_t aligned_bytes = ((SIZE + page_size - 1) / page_size) * page_size;
 
-    // Pin memory
-    h_data = (char*)mmap(nullptr, aligned_bytes, PROT_READ,
+    h_data = (char*)mmap(nullptr, aligned_bytes, PROT_READ | PROT_WRITE,
                         MAP_SHARED | MAP_LOCKED, shm_fd, 0);
     if (h_data == MAP_FAILED) {
         perror("mmap");
@@ -50,6 +49,7 @@ int main() {
         return 1;
     }
     std::cout << "Shared memory opened successfully.\n";
+    //CHECK(cudaHostRegister((void*)h_data, aligned_bytes, cudaHostRegisterDefault));
 
     CHECK(cudaMalloc((void**)&d_data, aligned_bytes));
     CHECK(cudaMemcpy(d_data, h_data, SIZE, cudaMemcpyHostToDevice));
@@ -63,6 +63,9 @@ int main() {
     std::cout << "H2D latency: " << elapsed_ms << " ms, "
               << (SIZE / (1 << 30)) / (elapsed_ms / 1e3) << " GB/s" << std::endl;
 
+
+    std::cout << "Message from writer: " << std::string(h_data, 24) << std::endl;
+    //CHECK(cudaHostUnregister((void*)h_data));
 cleanup:
     if (d_data) cudaFree(d_data);
     if (h_data != MAP_FAILED) munmap(h_data, aligned_bytes);
