@@ -72,7 +72,7 @@ int main() {
     std::cin.get();
 
     // Cleanup
-    cudaHostUnregister(h_data);
+    cudaHostUnregister(ptr);
     munmap(h_data, aligned_bytes);
     close(shm_fd);
     shm_unlink(SHM_NAME);
