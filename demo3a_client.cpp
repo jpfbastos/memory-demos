@@ -56,7 +56,11 @@ int main() {
     }
     std::cout << "Shared memory opened successfully.\n";
 
+    start = std::chrono::high_resolution_clock::now();
     CHECK(cudaHostRegister((void*)h_data, aligned_bytes, cudaHostRegisterDefault));
+    end = std::chrono::high_resolution_clock::now();
+    elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    std::cout << "cudaHostRegister took " << elapsed_ms << " ms\n";
 
     CHECK(cudaMalloc((void**)&d_data, aligned_bytes));
 
