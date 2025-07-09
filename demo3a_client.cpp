@@ -8,7 +8,7 @@
 
 const char* SHM_NAME = "/my_shared_mem";
 const size_t SIZE = 10ULL * 1024 * 1024 * 1024; // 10 GB
-const int NUM_WARM_UP = 3; // Number of warm-up iterations
+const int NUM_WARM_UP = 1; // Number of warm-up iterations
 const int NUM_TRIALS = 10; // Number of trials for averaging
 
 #define CHECK(call)                                                   \
@@ -56,7 +56,7 @@ int main() {
     }
     std::cout << "Shared memory opened successfully.\n";
 
-    CHECK(cudaHostRegister((void*)h_data, aligned_bytes, cudaHostRegisterDefault));
+    //CHECK(cudaHostRegister((void*)h_data, aligned_bytes, cudaHostRegisterDefault));
 
     CHECK(cudaMalloc((void**)&d_data, aligned_bytes));
 
