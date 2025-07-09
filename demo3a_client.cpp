@@ -56,7 +56,7 @@ int main() {
     }
     std::cout << "Shared memory opened successfully.\n";
 
-    //CHECK(cudaHostRegister((void*)h_data, aligned_bytes, cudaHostRegisterDefault));
+    CHECK(cudaHostRegister((void*)h_data, aligned_bytes, cudaHostRegisterDefault));
 
     CHECK(cudaMalloc((void**)&d_data, aligned_bytes));
 
