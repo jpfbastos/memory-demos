@@ -7,7 +7,7 @@
 #include <cuda_runtime_api.h>
 
 const char* SHM_NAME = "/my_shared_mem";
-const size_t SIZE = 10ULL * 1024 * 1024 * 1024; // 10 GB
+const size_t SIZE = 40ULL * 1024 * 1024 * 1024; // 40 GB
 const int NUM_WARM_UP = 1; // Number of warm-up iterations
 const int NUM_TRIALS = 10; // Number of trials for averaging
 
