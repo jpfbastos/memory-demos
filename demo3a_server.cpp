@@ -6,7 +6,7 @@
 #include <cuda_runtime_api.h>
 
 constexpr const char* SHM_NAME = "/my_shared_mem";
-constexpr size_t SIZE = 40ULL * 1024 * 1024 * 1024; // 40 GB
+constexpr size_t SIZE = 8ULL * 1024 * 1024 * 1024; // 8 GB
 constexpr const char* MESSAGE = "Writer says hello :)";
 
 int main() {

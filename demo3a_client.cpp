@@ -7,7 +7,7 @@
 #include <cuda_runtime_api.h>
 
 const char* SHM_NAME = "/my_shared_mem";
-const size_t SIZE = 40ULL * 1024 * 1024 * 1024; // 40 GB
+const size_t SIZE = 8ULL * 1024 * 1024 * 1024; // 40 GB
 const int NUM_WARM_UP = 1; // Number of warm-up iterations
 const int NUM_TRIALS = 10; // Number of trials for averaging
 
@@ -46,6 +46,7 @@ int main() {
 
     size_t page_size = 4 * 1024 * 1024; // 4MB
     size_t aligned_bytes = ((SIZE + page_size - 1) / page_size) * page_size;
+    std::cout << "Aligned bytes: " << aligned_bytes << std::endl;
 
     h_data = (char*)mmap(nullptr, aligned_bytes, PROT_READ | PROT_WRITE,
                         MAP_SHARED, shm_fd, 0);
