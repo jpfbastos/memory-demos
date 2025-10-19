@@ -3,7 +3,7 @@ and calculate memory througput from shared pinned memory to GPU.
 
 - Demo 1 uses a simple System V shared memory to share memory between two processes
 - Demo 2 creates CUDA pinned memory, and shares it, with the client copying the memory to a GPU
-- Demo 3a builds on this and calculates the time taken for CUDA to perform `cudaHostRegister` and the copy throughput from shared pinned memory to GPU
+- Demo 3a builds on this and calculates the time taken for CUDA to register memory in host memory (`demo3a_register_time.cpp`) and the copy throughput from shared pinned memory to GPU (`demo3a_throughput.cpp`)
 - Demo 4a uses a gRPC server to manage a shared memory pool, and a fixed-size chunk is returned to the client for use
 - Demo 4b would add a permission check, where only the specific PID could access the shared memory \[NOT WORKING]
 - Demo 5 allows for clients to allocate and free memory variable sizes. Chunks are collected and mapped to form seemingly contiguous memory for the client to use under a single shared memory name
