@@ -7,7 +7,7 @@
 #include <cuda_runtime_api.h>
 
 const char* SHM_NAME = "/my_shared_mem";
-const size_t SIZE = 8ULL * 1024 * 1024 * 1024; // 40 GB
+const size_t SIZE = 25ULL * 1024 * 1024 * 1024; // 25 GB
 const int NUM_WARM_UP = 1; // Number of warm-up iterations
 const int NUM_TRIALS = 10; // Number of trials for averaging
 
@@ -31,11 +31,11 @@ int main() {
     double total_time = 0;
     auto start = std::chrono::high_resolution_clock::now();
     auto end = std::chrono::high_resolution_clock::now();
-    double bandwidth_gbps;
+    double throughput_gbps;
     double elapsed_ms;
     double avg_time;
-    double avg_bandwidth;
-    int return_code;
+    double avg_throughput;
+    int return_code = 0;
 
     // Open shared memory object
     int shm_fd = shm_open(SHM_NAME, O_RDWR, 0640);
@@ -58,15 +58,6 @@ int main() {
     std::cout << "Shared memory opened successfully.\n";
 
     CHECK(cudaHostRegister((void*)h_data, aligned_bytes, cudaHostRegisterDefault));
-    CHECK(cudaHostUnregister((void*)h_data));
-
-    CHECK(cudaDeviceSynchronize());
-    start = std::chrono::high_resolution_clock::now();
-    CHECK(cudaHostRegister((void*)h_data, aligned_bytes, cudaHostRegisterDefault));
-    CHECK(cudaDeviceSynchronize());
-    end = std::chrono::high_resolution_clock::now();
-    elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
-    std::cout << "cudaHostRegister took " << elapsed_ms << " ms\n";
 
     CHECK(cudaMalloc((void**)&d_data, aligned_bytes));
 
@@ -91,16 +82,16 @@ int main() {
         elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
         total_time += elapsed_ms;
         
-        bandwidth_gbps = (SIZE / (1024.0 * 1024.0 * 1024.0)) / (elapsed_ms / 1000.0);
+        throughput_gbps = (SIZE / (1024.0 * 1024.0 * 1024.0)) / (elapsed_ms / 1000.0);
         std::cout << "Trial " << trial + 1 << ": " << elapsed_ms << " ms, " 
-                  << bandwidth_gbps << " GB/s\n";
+                  << throughput_gbps << " GB/s\n";
     }
 
     avg_time = total_time / NUM_TRIALS;
-    avg_bandwidth = (SIZE / (1024.0 * 1024.0 * 1024.0)) / (avg_time / 1000.0);
+    avg_throughput = (SIZE / (1024.0 * 1024.0 * 1024.0)) / (avg_time / 1000.0);
     
     std::cout << "\nAverage H2D: " << avg_time << " ms, " 
-              << avg_bandwidth << " GB/s" << std::endl;
+              << avg_throughput << " GB/s" << std::endl;
 
     std::cout << "Message from writer: " << std::string(h_data, 24) << std::endl;
     CHECK(cudaHostUnregister((void*)h_data));
@@ -110,5 +101,5 @@ cleanup:
     if (h_data != MAP_FAILED) munmap(h_data, aligned_bytes);
     if (shm_fd != -1) close(shm_fd);
 
-    return 0;
+    return return_code;
 }
